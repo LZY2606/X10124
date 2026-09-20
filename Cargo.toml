@@ -1,0 +1,6 @@
+[workspace]
+
+members = [
+  # Ordering here apparently defines release order:
+  "governor",
+]
