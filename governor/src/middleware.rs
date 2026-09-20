@@ -294,3 +294,144 @@ mod test {
         );
     }
 }
+
+// Boundary tests for middleware that derives user-visible header fields
+// (like HTTP RateLimit-* / Retry-After) from the rejection snapshot. These
+// live inside the crate so they can construct/inspect StateSnapshot
+// directly; they exercise the exact `>=` boundary and batch weights.
+#[cfg(test)]
+mod header_boundary_tests {
+    use super::*;
+    use crate::clock::{Clock, FakeRelativeClock};
+    use crate::Quota;
+    use crate::RateLimiter;
+    use nonzero_ext::nonzero;
+    use std::time::Duration;
+
+    /// Visible rate-limit header fields on an admitted decision.
+    #[derive(Debug, PartialEq, Eq)]
+    struct AllowHeaders {
+        limit: u32,
+        remaining: u32,
+    }
+
+    /// A rejection, as seen by a real HTTP middleware. The transport layer
+    /// turns this into header fields: it evaluates the retry wait against
+    /// its own current clock reading (`wait_time_from(now)`), exactly like a
+    /// server emitting Retry-After from `Instant::now()`.
+    type DenyHeaders<P> = NotUntil<P>;
+
+    #[derive(Debug)]
+    struct HeaderMiddleware;
+
+    impl<P: clock::Reference> RateLimitingMiddleware<P> for HeaderMiddleware {
+        type PositiveOutcome = AllowHeaders;
+        type NegativeOutcome = DenyHeaders<P>;
+
+        fn allow<K>(_key: &K, state: impl Into<StateSnapshot>) -> AllowHeaders {
+            let snapshot: StateSnapshot = state.into();
+            AllowHeaders {
+                limit: snapshot.quota().burst_size().get(),
+                remaining: snapshot.remaining_burst_capacity(),
+            }
+        }
+
+        fn disallow<K>(_key: &K, state: impl Into<StateSnapshot>, start: P) -> DenyHeaders<P> {
+            NotUntil::new(state.into(), start)
+        }
+    }
+
+    fn retry_after_ns<P: clock::Reference>(denial: &NotUntil<P>, now: P) -> u64 {
+        denial.wait_time_from(now).as_nanos() as u64
+    }
+
+    #[test]
+    fn header_fields_track_single_cell_boundary_exactly() {
+        let clock = FakeRelativeClock::default();
+        let quota = Quota::with_period(Duration::from_nanos(10))
+            .unwrap()
+            .allow_burst(nonzero!(3u32));
+        let lim = RateLimiter::direct_with_clock(quota, clock.clone())
+            .with_middleware::<HeaderMiddleware>();
+
+        assert_eq!(
+            lim.check().unwrap(),
+            AllowHeaders {
+                limit: 3,
+                remaining: 2
+            }
+        );
+        assert_eq!(
+            lim.check().unwrap(),
+            AllowHeaders {
+                limit: 3,
+                remaining: 1
+            }
+        );
+        assert_eq!(
+            lim.check().unwrap(),
+            AllowHeaders {
+                limit: 3,
+                remaining: 0
+            }
+        );
+
+        // Rejected: the advertised retry wait is exactly one cell period.
+        assert_eq!(retry_after_ns(&lim.check().unwrap_err(), clock.now()), 10);
+
+        // One nanosecond before the endpoint the header still demands a wait.
+        clock.advance(Duration::from_nanos(9));
+        assert_eq!(retry_after_ns(&lim.check().unwrap_err(), clock.now()), 1);
+
+        // Exactly at the endpoint the cell is admitted; only the one cell
+        // that just replenished was available (remaining goes back to 0).
+        clock.advance(Duration::from_nanos(1));
+        assert_eq!(
+            lim.check().unwrap(),
+            AllowHeaders {
+                limit: 3,
+                remaining: 0
+            }
+        );
+    }
+
+    #[test]
+    fn header_fields_on_batch_rejection_match_weighted_admission() {
+        let clock = FakeRelativeClock::default();
+        let quota = Quota::with_period(Duration::from_nanos(10))
+            .unwrap()
+            .allow_burst(nonzero!(3u32));
+        let lim = RateLimiter::direct_with_clock(quota, clock.clone())
+            .with_middleware::<HeaderMiddleware>();
+
+        lim.check_n(nonzero!(3u32)).unwrap().unwrap();
+
+        // A full batch needs three cells: retry after 30ns.
+        assert_eq!(
+            retry_after_ns(
+                &lim.check_n(nonzero!(3u32)).unwrap().unwrap_err(),
+                clock.now()
+            ),
+            30
+        );
+        // A batch of two needs two cells of room: retry after 20ns.
+        assert_eq!(
+            retry_after_ns(
+                &lim.check_n(nonzero!(2u32)).unwrap().unwrap_err(),
+                clock.now()
+            ),
+            20
+        );
+
+        // Advance to the weighted endpoint of the 2-cell batch: it must be
+        // admitted there (not one period later).
+        clock.advance(Duration::from_nanos(20));
+        assert_eq!(
+            lim.check_n(nonzero!(2u32)).unwrap().unwrap(),
+            AllowHeaders {
+                limit: 3,
+                remaining: 0
+            }
+        );
+    }
+}
